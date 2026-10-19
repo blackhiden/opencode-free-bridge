@@ -1,0 +1,121 @@
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches:
+      - main  # Triggers the workflow when code is pushed to the main branch
+
+env:
+  REGISTRY: ghcr.io
+  # Converts the repository name to lowercase to prevent GHCR formatting errors
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    
+    # Required permissions to write packages to GHCR
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      # Step 1: Check out the source code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract Git Metadata
+        id: git_meta
+        run: |
+          # Fallback to 'unknown' if no tags exist yet
+          VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          COMMIT=$(git rev-parse --short HEAD)
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "COMMIT=$COMMIT" >> $GITHUB_OUTPUT
+
+          # Check if any version tags (v*) point to the current commit
+          CURRENT_TAGS=$(git tag --points-at HEAD | grep -E '^v[0-9]' || true)
+          if [ -n "$CURRENT_TAGS" ]; then
+            # Convert newline-separated tags to comma-separated for output
+            TAGS_CSV=$(echo "$CURRENT_TAGS" | tr '\n' ',' | sed 's/,$//')
+            echo "CURRENT_VERSION_TAGS=$TAGS_CSV" >> $GITHUB_OUTPUT
+            echo "HAS_VERSION_TAG=true" >> $GITHUB_OUTPUT
+            echo "Found version tags on current commit: $TAGS_CSV"
+          else
+            echo "CURRENT_VERSION_TAGS=" >> $GITHUB_OUTPUT
+            echo "HAS_VERSION_TAG=false" >> $GITHUB_OUTPUT
+            echo "No version tags found on current commit"
+          fi
+
+      # QEMU is required to emulate the arm64 architecture on the x86 runner
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      # Step 2: Set up Docker Buildx (enables caching and multi-platform builds)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Step 3: Log in to the GitHub Container Registry
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+       # Step 4: Generate dynamic tags list based on detected version tags
+      - name: Generate Docker tags list
+        id: tags
+        run: |
+          TAGS=""
+          
+          # Base tags for branch push
+          TAGS="${TAGS}type=ref,event=branch"$'\n'
+          TAGS="${TAGS}type=ref,event=tag"$'\n'
+          TAGS="${TAGS}type=sha,format=short"$'\n'
+          TAGS="${TAGS}type=raw,value=latest,enable=${{ github.ref == 'refs/heads/master' }}"
+          
+          # If version tags exist on this commit, add them as additional tags
+          if [ "${{ steps.git_meta.outputs.HAS_VERSION_TAG }}" = "true" ]; then
+            IFS=',' read -ra TAG_ARRAY <<< "${{ steps.git_meta.outputs.CURRENT_VERSION_TAGS }}"
+            for TAG in "${TAG_ARRAY[@]}"; do
+              # Add each version tag
+              TAGS="${TAGS}"$'\n'"type=raw,value=${TAG}"
+              # Also add without 'v' prefix if present (e.g., v1.0.0 -> 1.0.0)
+              if [[ "$TAG" =~ ^v([0-9].*)$ ]]; then
+                TAGS="${TAGS}"$'\n'"type=raw,value=${BASH_REMATCH[1]}"
+              fi
+            done
+          fi
+          
+          # Output the tags in a format compatible with metadata-action
+          echo "tags_list<<EOF" >> $GITHUB_OUTPUT
+          echo "$TAGS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      # Step 5: Extract Docker metadata (tags and labels)
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: ${{ steps.tags.outputs.tags_list }}
+
+      # Step 6: Build the Dockerfile and push it to GHCR
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          file: ./Dockerfile
+          build-args: |
+            APP_VERSION=${{ steps.git_meta.outputs.VERSION }}
+            APP_COMMIT=${{ steps.git_meta.outputs.COMMIT }}
+          # platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
