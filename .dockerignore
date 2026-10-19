@@ -1,0 +1,52 @@
+# Docker ignore file for opencode-free-bridge
+# Reduces build context size and prevents unnecessary file copies
+
+# Git
+.git
+.gitignore
+.github
+
+# Documentation (not needed in runtime container)
+README.md
+AGENTS.md
+CHANGELOG.md
+CODE_GRAPH.md
+LICENSE
+
+# Tests (not needed in production)
+test/
+
+# Development files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+
+# Cache and temporary files
+.cache/
+tmp/
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Node modules (zero dependencies project, but just in case)
+node_modules/
+
+# Build artifacts
+dist/
+build/
+
+# Environment files (should be passed at runtime)
+.env
+.env.*
+
+# Backup files
+*.backup
+.backup-*

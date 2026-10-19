@@ -1,0 +1,90 @@
+version: '3.8'
+
+services:
+  opencode-free-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: opencode-free-bridge:latest
+    container_name: opencode-free-bridge
+    restart: unless-stopped
+    
+    ports:
+      - "20129:20129"
+    
+    environment:
+      # Server configuration
+      - PORT=20129
+      - HOST=0.0.0.0
+      
+      # Optional: Update mode (reactive or always)
+      # - UPDATE_MODE=reactive
+      
+      # Optional: Auto-update (enabled by default)
+      # - AUTO_UPDATE=1
+      
+      # Optional: Cache directory
+      - OPENCODE_CACHE_DIR=/app/.cache
+      
+      # Optional: Timeouts
+      # - UPSTREAM_TIMEOUT_MS=120000
+      # - IDENTITY_TTL_MS=900000
+      
+      # Optional: CORS origin (empty string disables CORS)
+      # - CORS_ORIGIN=
+    
+    volumes:
+      # Persist catalog cache across container restarts
+      - cache-data:/app/.cache
+    
+    # Resource limits (adjust based on your needs)
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:20129/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  cache-data:
+    driver: local
+
+# Optional: Multi-host setup with multiple bridges
+# Uncomment to run additional instances on different ports
+#
+# opencode-free-bridge-2:
+#   build:
+#     context: .
+#     dockerfile: Dockerfile
+#   image: opencode-free-bridge:latest
+#   container_name: opencode-free-bridge-2
+#   restart: unless-stopped
+#   ports:
+#     - "20130:20129"
+#   environment:
+#     - PORT=20129
+#     - HOST=0.0.0.0
+#     - OPENCODE_CACHE_DIR=/app/.cache
+#   volumes:
+#     - cache-data-2:/app/.cache
+#
+# volumes:
+#   cache-data-2:
+#     driver: local
