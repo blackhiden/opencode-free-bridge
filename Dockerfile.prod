@@ -1,0 +1,71 @@
+# opencode-free-bridge Production Dockerfile
+# Multi-stage build for minimal, secure production images
+# Requires Bun runtime for TLS fingerprint parity with OpenCode CLI
+
+# ============================================================================
+# Stage 1: Builder - Select and prepare production files
+# ============================================================================
+FROM oven/bun:1.4.3-slim AS builder
+
+WORKDIR /build
+
+# Copy all source files (.dockerignore excludes tests, docs, .git, etc.)
+COPY --chown=bun:bun . .
+
+# Verify critical runtime files exist (fail fast if something is missing)
+RUN test -f server.js && \
+    test -f identity.js && \
+    test -f token-budget.js && \
+    test -f transport-fingerprint.js && \
+    test -f transport-baseline.json && \
+    test -f proxy.js && \
+    test -f panel.js && \
+    test -f package.json && \
+    echo "✓ All critical runtime files present"
+
+# ============================================================================
+# Stage 2: Runtime - Minimal production image
+# ============================================================================
+FROM oven/bun:1.4.3-slim AS runtime
+
+# Set production environment variables
+ENV NODE_ENV=production \
+    PORT=20129 \
+    HOST=0.0.0.0 \
+    OPENCODE_CACHE_DIR=/data/cache \
+    OPENCODE_BRIDGE_STATE_DIR=/data/state \
+    AUTO_UPDATE=0
+
+WORKDIR /app
+
+# Copy runtime files from builder stage
+COPY --from=builder --chown=bun:bun /build ./
+
+# Create data directories and set permissions
+# The self-updater stages temp files in /app, so it must be writable by bun user
+# (COPY --chown chowns files but not the directories)
+RUN mkdir -p /data/cache /data/state && \
+    chown -R bun:bun /data /app && \
+    chmod 755 /app && \
+    chmod 644 /app/*.js /app/*.json /app/*.md && \
+    chmod 755 /app/*.sh
+
+# Switch to non-root user for security
+USER bun
+
+# Expose the bridge port
+EXPOSE 20129
+
+# Health check - verifies the server is responding
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+  CMD bun -e "fetch('http://127.0.0.1:'+(process.env.PORT||'20129')+'/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+
+# Start the bridge server
+CMD ["bun", "server.js"]
+
+# Build-time metadata
+LABEL org.opencontainers.image.title="opencode-free-bridge" \
+      org.opencontainers.image.description="OpenAI-compatible local API bridge for OpenCode free-tier models" \
+      org.opencontainers.image.vendor="opencode-free-bridge" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.source="https://github.com/blackhiden/opencode-free-bridge"

@@ -40,6 +40,7 @@ echo "----------------------------------------"
 
 echo "Building the Docker image..."
 docker build \
+  -f Dockerfile.prod \
   -t ${IMAGE_NAME} \
   --build-arg APP_COMMIT="${APP_COMMIT}" \
   --build-arg APP_VERSION="${APP_VERSION}" \
