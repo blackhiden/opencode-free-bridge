@@ -1,5 +1,204 @@
 # Changelog
 
+## [2.2.1] — 2026-10-22
+
+Hardening for the egress proxy shipped in 2.2.0. The feature worked, but three
+defects made it unsafe to leave as-is.
+
+### An upgrade from 2.1.0 could crash the bridge
+
+2.1.0's self-updater had no `proxy.js`/`panel.js` in `UPDATE_FILES`. Updating
+such an install to 2.2.0 wrote a `server.js` that required those modules,
+restarted, and died with `Cannot find module './proxy'` — a crash loop with no
+recovery except reinstalling. Reproduced end to end before fixing.
+
+- `server.js` and `identity.js` now load `proxy`/`panel` tolerantly: a missing
+  own module degrades to direct egress instead of throwing at require time.
+  Only a missing *own* module is tolerated; a real error inside the file still
+  surfaces.
+- The updater reads the **incoming** `server.js`, extracts its relative
+  requires, and stages any module the running file list does not name. An old
+  `UPDATE_FILES` can no longer install a server it cannot boot.
+- On boot, `repairMissingModules()` re-fetches modules that `server.js` requires
+  but that are absent, so an already-broken 2.2.0 install heals on restart
+  instead of needing `install.sh`. Best-effort and non-blocking.
+
+### The panel API was writable from any website (CSRF)
+
+`POST /api/proxy` accepted `text/plain`, which browsers send cross-origin
+without a preflight, and it never looked at `Origin`, `Sec-Fetch-Site`, or
+`Host`. Any page the operator visited could point the bridge's egress — and its
+self-updater — at an attacker's proxy, or switch it off.
+
+- Writes require `Content-Type: application/json` (415 otherwise).
+- Cross-site requests are refused (403) on `Sec-Fetch-Site` and on a foreign
+  `Origin`.
+- The `Host` header must be a loopback name, the configured bind address, or an
+  entry in `PANEL_ALLOWED_HOSTS`, which closes DNS rebinding.
+- The panel is served with `X-Frame-Options: DENY`, and `HEAD /` works again
+  instead of returning 404.
+
+### Container lost the proxy setting
+
+`proxy.json` was written to `~/.opencode-free-bridge` inside the container,
+which is discarded on recreate. The image now sets
+`OPENCODE_BRIDGE_STATE_DIR=/data/state` and compose mounts a `bridge-state`
+volume there.
+
+### Node compatibility
+
+`testProxy` correctly refuses to run on Node (Node's fetch ignores the `proxy`
+option, so a probe would report success while going out directly), but two
+tests asserted the Bun behaviour unconditionally. They now assert the refusal
+on Node and the probe verdict on Bun.
+
+## [2.2.0] — 2026-10-21
+
+### Egress proxy, configured from the browser
+
+`http://127.0.0.1:20129/` now serves a panel instead of the health document, and
+the panel sets an HTTP proxy for **every** outbound request the bridge makes:
+inference, model discovery, identity/update sync, and the self-updater. Upstream
+sees the proxy's IP, not this machine's.
+
+- **`proxy.js`:** validates `http://`/`https://` URLs (percent-encoded
+  credentials supported), refuses SOCKS with Bun's own reason
+  (`UnsupportedProxyProtocol`), persists to `~/.opencode-free-bridge/proxy.json`
+  at mode `0600`, and exposes `netFetch()` — one egress point used by `server.js`
+  and `identity.js`. `UPSTREAM_PROXY_URL` is an operator override that also locks
+  runtime edits.
+- **`panel.js`:** HTML panel plus `/api/proxy` (GET status, POST set/clear) and
+  `/api/proxy/test` (probe). Status, `/api/proxy`, and `/health` expose `host:port`
+  only; credentials never leave the process.
+- **Test before trusting it:** the probe fetches the models endpoint through the
+  candidate and reports the exit IP from `cdn-cgi/trace`, so a working tunnel with
+  a refused egress (403) is distinguishable from a broken proxy.
+- **No restart:** the URL is read per request.
+- **`/health`:** `egress.mode` is now what actually carries traffic (`proxy`,
+  `relay`, `direct`), with `egress.proxy` describing the proxy state.
+  `verify.js` prints the egress line before probing.
+- **Relay interaction:** with both configured, the request still targets
+  `UPSTREAM_RELAY_URL` and that connection is dialled through the proxy.
+- **Delivery:** `proxy.js` and `panel.js` added to `package.json` `files`,
+  `UPDATE_FILES`, and `install.sh` (fetch, syntax check, install, backup), so the
+  self-updater cannot leave an install missing the modules `server.js` requires.
+
+### `install.sh` installs the checkout it runs from
+
+`bash install.sh` inside a clone always downloaded from GitHub, so a file added
+in the working tree but not yet pushed failed the install with a bare
+`curl: (22) The requested URL returned error: 404` that named neither the file
+nor the cause. `SOURCE=auto` now installs the local working tree when the script
+runs from a checkout, the remote path names the file it could not fetch and
+points at `SOURCE=local` as the way out, and `SOURCE=remote` restores the old
+behaviour. The `curl | bash` route is unchanged.
+
+## [2.1.0] — 2026-10-21
+
+### Container deployment
+
+The bridge can now run in a container. `Dockerfile` and `docker-compose.yaml`
+were contributed in PR #1 by [@rustam76](https://github.com/rustam76); this
+release completes them so the container is actually usable. Their commits stay
+in the history of this repository as the base of the merge.
+
+- **Pinned base image (`oven/bun:1.4.3-slim`).** The free-tier gate inspects
+  the TLS ClientHello, so the Bun version in the image is not interchangeable
+  with any other. The pinned tag is the version the fingerprint baseline was
+  measured on, and `bun transport-fingerprint.js --check` passes inside the
+  image.
+- **Writable `/app` (`chown -R bun:bun /data /app`).** `COPY --chown` chowns
+  the copied files but not the directory that holds them, so `/app` stayed
+  root-owned while the process ran as `bun`. The self-updater stages its temp
+  files next to their targets inside `__dirname`, so every in-place update
+  died with `EACCES: permission denied`.
+- **Loopback-only port publish.** The compose file only had `expose:`, which
+  publishes inside the compose network, so the documented base URL
+  (`http://127.0.0.1:20129/v1`) was unreachable from the host. It now publishes
+  `127.0.0.1:20129:20129` — loopback on purpose, because the bridge has no
+  authentication and a `0.0.0.0` publish would be an open relay.
+- **`AUTO_UPDATE=0` by default.** The image is the unit of deployment, so an
+  in-place self-update is reverted by the next `docker compose build`. Upgrade
+  with `docker compose build --pull && docker compose up -d`.
+- **`.dockerignore`.** Keeps `.git`, `.github`, and `test/` out of the build
+  context. A `.git` directory inside the image defeats the self-updater's
+  `git-checkout` guard, and it is not something a published image should
+  carry.
+- **Hardened runtime:** `cap_drop: [ALL]` next to `no-new-privileges`, and a
+  `HEALTHCHECK` in the Dockerfile so a plain `docker run` is health-checked too.
+- **Docs:** README gains a Docker install section, AGENTS.md a container
+  install option and rows for the new files.
+
+The container files ship in the repository, not in the npm tarball: they are
+build inputs for a checkout, not runtime files a host install needs, so they
+stay out of `package.json` `files` (which the self-updater and `install.sh`
+both have to deliver).
+
+### A note on the contributor graph
+
+[@MBMoulidharan](https://github.com/MBMoulidharan) is the same person as
+[@rustam76](https://github.com/rustam76) — two accounts registered ninety
+minutes apart on 2019-04-12, with user IDs `49561459` and `49564359` (the
+digits transposed). Only `rustam76` authored anything here: all three commits
+of PR #1 are attributed to `rustam76` by GitHub itself.
+
+A `Co-Authored-By` trailer on the merge and the follow-up commit briefly
+carried `49561459+rustam76@users.noreply.github.com` — a transposed typo —
+and GitHub maps the numeric prefix of a `noreply` address to the account with
+that id, so the credit landed on `MBMoulidharan` and produced a second entry
+in the contributor graph. The trailer is corrected in the current history.
+Forks taken before the correction still carry the old commits, so their graphs
+show the same extra entry until they re-sync.
+
+---
+
+## [2.0.3] — 2026-10-20
+
+### IP-level abuse blocks are terminal, not a stale identity
+
+Upstream now returns a second, explicit `403 FreeTierError` message for a
+network-level flag (*"OpenCode's free models aren't available from your current
+network because we've detected abusive traffic from this IP address"*, and the
+earlier `Forbidden, OpenCode Free Model Gateway Detect Abuse Traffic`). The
+bridge treated it like the shape gate: forced a GitHub/catalog refresh, re-minted
+the session id, and replayed the request once. No identity change can clear a
+flag keyed to the egress IP, so the retry only extended the penalty and appended
+a misleading "update opencode-free-bridge" hint to the refusal.
+
+- **Terminal classifier (`identity.js`):** `isIpAbuseRejection` matches the
+  known phrasings; `onGateRejection` returns `{retry:false, reason:"ip-abuse",
+  terminal:true}` before consulting the refresh cooldown.
+- **No refresh, no retry (`server.js`):** the gate branch short-circuits on the
+  first abuse message and returns it verbatim with
+  `X-OpenCode-Gate: ip-abuse` and upstream's `x-opencode-log-id`. The retry path
+  applies the same rule when the first attempt carried the ambiguous shape
+  message.
+- **Accurate diagnosis:** `/health` reports `identity.gate.status: "ip-blocked"`
+  plus `ipBlockedSince` and `lastRejection.kind`, and a later success clears it.
+  The generic gate diagnostic is labelled `kind: "free-tier-gate"`.
+- **`verify.js`:** reads `X-OpenCode-Gate` (`ip-throttled` / `ip-abuse` →
+  `gate-closed`, exit `2`; `shape-rejected` → failure) and falls back to the
+  abuse wording. A correctly installed bridge is no longer reported as broken,
+  and the installer repeats the right verdict.
+- **Tests:** both abuse phrasings assert exactly one upstream call, zero
+  `onGateRejection` calls, a verbatim body, and the `ip-abuse` header; identity
+  tests assert no refresh; the retry path is covered when the block appears only
+  on the second attempt.
+- **Docs:** README and AGENTS troubleshooting sections now route abuse blocks to
+  upstream support instead of reinstall/update advice.
+
+### Optional egress relay
+
+`UPSTREAM_RELAY_URL` sends inference through a relay implementing the 9Router
+`x-relay-target` / `x-relay-path` contract, so upstream sees the relay's egress
+IP instead of this host's. It covers the initial request and every retry; model
+discovery and identity sync stay direct. Empty (the default) keeps direct
+egress. `/health` reports `egress.mode` and the relay's origin only (credentials
+and query strings are not exposed), and changing the variable requires a
+restart.
+
+---
+
 ## [2.0.1] — 2026-10-18
 
 ### Tunnel lifecycle tooling actually reaches installed hosts

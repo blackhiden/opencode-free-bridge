@@ -27,6 +27,21 @@
  */
 
 const crypto = require("crypto");
+// Identity sync is egress too: the update handshake, GitHub source reads, and
+// the provider catalog all travel through the same proxy the panel configures.
+// `proxy.netFetch` is a thin wrapper over `fetch`, so tests that replace
+// `global.fetch` keep intercepting every call.
+//
+// Loaded tolerantly: a 2.1.0 install updated by its own (older) updater can be
+// missing `proxy.js`, and identity sync must degrade to direct egress rather
+// than crash the process that would otherwise repair itself.
+let proxy;
+try {
+  proxy = require("./proxy");
+} catch (err) {
+  if (err.code !== "MODULE_NOT_FOUND" || !String(err.message).includes("'./proxy'")) throw err;
+  proxy = { netFetch: (url, init) => fetch(url, init) };
+}
 
 const UPDATE_API_BASE =
   process.env.OPENCODE_UPDATE_API_BASE || "https://opencode.ai/update/api";
@@ -369,7 +384,7 @@ function sourceRef(release) {
 }
 
 async function fetchJson(url, timeoutMs = HANDSHAKE_TIMEOUT_MS) {
-  const res = await fetch(url, {
+  const res = await proxy.netFetch(url, {
     signal: AbortSignal.timeout(timeoutMs),
     headers: { accept: "application/json" },
   });
@@ -378,7 +393,7 @@ async function fetchJson(url, timeoutMs = HANDSHAKE_TIMEOUT_MS) {
 }
 
 async function fetchText(url, timeoutMs = SOURCE_TIMEOUT_MS) {
-  const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+  const res = await proxy.netFetch(url, { signal: AbortSignal.timeout(timeoutMs) });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.text();
 }
@@ -394,7 +409,7 @@ async function fetchText(url, timeoutMs = SOURCE_TIMEOUT_MS) {
  */
 async function listSourceDir(dir, ref, timeoutMs = SOURCE_TIMEOUT_MS) {
   try {
-    const res = await fetch(
+    const res = await proxy.netFetch(
       `${GITHUB_API}/repos/${REPO}/contents/${dir}?ref=${encodeURIComponent(ref)}`,
       { signal: AbortSignal.timeout(timeoutMs), headers: { accept: "application/vnd.github+json" } }
     );
@@ -2026,11 +2041,41 @@ function ensureFresh() {
 }
 
 /**
+ * Upstream's IP-level abuse block.
+ *
+ * Known variants (all HTTP 403, `error.type: FreeTierError`):
+ *
+ *   - "OpenCode's free models aren't available from your current network
+ *      because we've detected abusive traffic from this IP address. ..."
+ *   - "Forbidden, OpenCode Free Model Gateway Detect Abuse Traffic"
+ *   - "Abuse of traffic" (short form)
+ *
+ * Unlike the shape gate ("OpenCode's free tier can only be used from within
+ * OpenCode"), no identity change can clear this: the gateway keys it to the
+ * egress network, and the official CLI gets the same answer from the same IP.
+ * Retrying only extends the penalty, so callers must not refresh or replay.
+ */
+function isIpAbuseRejection(status, errMsg) {
+  if (status !== 403) return false;
+  const m = String(errMsg || "").toLowerCase();
+  return (
+    m.includes("abusive traffic") ||
+    m.includes("abuse traffic") ||
+    m.includes("abuse of traffic")
+  );
+}
+
+/**
  * Reactive self-heal when upstream rejects our request with a CLI gate error
  * (403 FreeTierError or 426 UpgradeRequired).
  */
 async function onGateRejection(status, errType, errMsg, attempted = false) {
   if (attempted) return { retry: false, reason: "already-retried" };
+  // A network-level block is terminal: refreshing the recipe cannot change
+  // which IP the request leaves from, so skip the GitHub/catalog fetch.
+  if (isIpAbuseRejection(status, errMsg)) {
+    return { retry: false, reason: "ip-abuse", terminal: true };
+  }
 
   const versionBefore = recipe.version;
   const toolsBefore = stableStringify(getTools());
@@ -2545,6 +2590,7 @@ module.exports = {
   refresh,
   ensureFresh,
   onGateRejection,
+  isIpAbuseRejection,
   createId,
   getUserAgent,
   getRecipe,
