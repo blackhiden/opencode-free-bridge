@@ -9,6 +9,139 @@ try {
 } catch {}
 const { effectiveMaxTokens } = require("./token-budget");
 
+/**
+ * Load a sibling module, or a fallback when the file is not on disk yet.
+ *
+ * This exists because of a real upgrade path: 2.1.0's self-updater had no
+ * `proxy.js`/`panel.js` in its file list, so updating that install to 2.2.0
+ * wrote a `server.js` that required modules the updater never fetched. A hard
+ * `require` turned that into a crash loop (`Cannot find module './proxy'`)
+ * after the restart, with no way back except reinstalling. A missing optional
+ * module must degrade to direct egress, never prevent the process from booting.
+ *
+ * Only a missing *own* module is tolerated. If `proxy.js` exists but requires
+ * something absent, that is a broken install and the error must surface.
+ */
+function loadLocalModule(name, fallback) {
+  try {
+    return require(`./${name}`);
+  } catch (err) {
+    if (err.code !== "MODULE_NOT_FOUND" || !String(err.message).includes(`'./${name}'`)) throw err;
+    return fallback;
+  }
+}
+
+const PROXY_FALLBACK = {
+  getProxyUrl: () => "",
+  withProxy: (init) => init,
+  netFetch: (url, init) => fetch(url, init),
+  describe: () => ({
+    mode: "direct",
+    proxy: null,
+    hasCredentials: false,
+    source: "none",
+    locked: false,
+    configPath: null,
+    error: "proxy.js belum terpasang; egress langsung. Jalankan ulang install.sh.",
+  }),
+  setProxyUrl: () => ({
+    ok: false,
+    error: "proxy.js belum terpasang. Jalankan ulang install.sh atau tunggu perbaikan otomatis.",
+  }),
+  testProxy: async () => ({ ok: false, error: "proxy.js belum terpasang." }),
+};
+
+const PANEL_FALLBACK = {
+  renderPanel: () =>
+    "<!doctype html><meta charset=\"utf-8\"><title>opencode-free-bridge</title>" +
+    "<body style=\"font:16px/1.5 system-ui;max-width:40rem;margin:4rem auto;padding:0 1rem\">" +
+    "<h1>Instalasi belum lengkap</h1>" +
+    "<p><code>proxy.js</code> dan <code>panel.js</code> tidak ditemukan di direktori ini. " +
+    "Bridge tetap berjalan dengan egress langsung. Jalankan ulang " +
+    "<code>install.sh</code> untuk memasang panel.</p></body>",
+};
+
+// Egress proxy and the panel that configures it. Loaded before anything else
+// touches the network so the first request already honours a saved proxy.
+let proxy = loadLocalModule("proxy", PROXY_FALLBACK);
+let panel = loadLocalModule("panel", PANEL_FALLBACK);
+
+/**
+ * Local modules this server requires by relative path. The self-updater uses
+ * this to refuse an update that would install a `server.js` whose imports are
+ * not part of the release, and boot uses it to repair a half-installed tree.
+ */
+function localRequires(source) {
+  const names = new Set();
+  // Strip comments first: the doc comment above names `require("./x")` as an
+  // example, and scanning it produced a bogus `x.js` dependency.
+  const text = String(source || "")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+  // `require("./x")` and the tolerant `loadLocalModule("x", …)` loader both
+  // name a file that must be present for this server to work.
+  for (const re of [/\brequire\(\s*["']\.\/([A-Za-z0-9._-]+)["']\s*\)/g, /\bloadLocalModule\(\s*["']([A-Za-z0-9._-]+)["']/g]) {
+    let match;
+    while ((match = re.exec(text))) {
+      if (match[1].endsWith(".json")) continue;
+      const name = match[1].endsWith(".js") ? match[1] : `${match[1]}.js`;
+      names.add(name);
+    }
+  }
+  return [...names];
+}
+
+/**
+ * Fetch files that `server.js` requires but that are not on disk.
+ *
+ * 2.1.0 shipped a self-updater whose file list predated `proxy.js`/`panel.js`,
+ * so an update to 2.2.0 wrote a server that could not boot. That install now
+ * starts with the fallbacks above; this repairs it on the next boot instead of
+ * leaving the panel permanently unavailable. Best-effort: a failure keeps the
+ * fallback, never blocks startup.
+ */
+async function repairMissingModules(dir = __dirname) {
+  const fs = require("fs");
+  const path = require("path");
+  const required = new Set(localRequires(fs.readFileSync(path.join(dir, "server.js"), "utf8")));
+  for (const name of ["proxy.js", "panel.js"]) required.add(name);
+  const missing = [...required].filter((f) => !fs.existsSync(path.join(dir, f)));
+  const repaired = [];
+  const failed = [];
+  for (const file of missing) {
+    try {
+      const res = await fetch(`${UPDATE_BASE_URL}/${file}?cb=${Date.now()}`, {
+        headers: { "Cache-Control": "no-cache" },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await res.text();
+      if (!text || text.length < 20) throw new Error("empty response");
+      new Function(text.replace(/^#!.*\n/, ""));
+      const tmp = path.join(dir, `.${file}.repair.${process.pid}`);
+      fs.writeFileSync(tmp, text, "utf8");
+      fs.renameSync(tmp, path.join(dir, file));
+      repaired.push(file);
+    } catch (err) {
+      failed.push(`${file}: ${err.message}`);
+    }
+  }
+  if (repaired.length && path.resolve(dir) === path.resolve(__dirname)) {
+    proxy = loadLocalModule("proxy", PROXY_FALLBACK);
+    panel = loadLocalModule("panel", PANEL_FALLBACK);
+    console.log(`[opencode-free-bridge] Repaired missing module(s): ${repaired.join(", ")}`);
+  } else if (repaired.length) {
+    console.log(`[opencode-free-bridge] Repaired missing module(s): ${repaired.join(", ")}`);
+  }
+  if (failed.length) {
+    console.warn(
+      `[opencode-free-bridge] Could not repair ${failed.join(", ")}; ` +
+        "running with direct egress. Re-run install.sh to fix this install."
+    );
+  }
+  return { repaired, failed };
+}
+
 const PORT = parseInt(process.env.PORT || "20129", 10);
 const HOST = process.env.HOST || "127.0.0.1";
 const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || "120000", 10);
@@ -18,6 +151,26 @@ const GATE_RETRY_COOLDOWN_MS = parseInt(
   10
 );
 const CORS_ORIGIN = process.env.CORS_ORIGIN !== undefined ? process.env.CORS_ORIGIN : "";
+// Optional egress relay. When set, every upstream inference request is sent to
+// this relay URL instead of directly to opencode.ai, with the real origin and
+// path carried in x-relay-target / x-relay-path (the same header contract
+// 9Router's Cloudflare/Vercel/Deno/Netlify relays speak). The relay performs
+// the final fetch, so upstream sees the relay's egress IP. Empty = direct.
+const UPSTREAM_RELAY_URL = (process.env.UPSTREAM_RELAY_URL || "").trim();
+
+/**
+ * Origin-only label for `/health`. The configured relay URL may carry
+ * credentials or a token in the query string; those must not be handed to any
+ * client that can reach the local health endpoint.
+ */
+function relayLabel(url) {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return "configured";
+  }
+}
+
 // Wire endpoints. These are *defaults*; the live values come from identity.js,
 // which resolves them from the upstream provider catalog (`opencode.api` in
 // models.opencode.ai/api.json) at refresh time. Reading them per request means
@@ -50,6 +203,8 @@ const UPDATE_FILES = [
   "transport-fingerprint.js",
   "transport-baseline.json",
   "tunnel-doctor.sh",
+  "proxy.js",
+  "panel.js",
   "server.js",
 ];
 let updateInFlight = null;
@@ -100,7 +255,7 @@ async function checkAndApplyUpdate() {
     const tmpFiles = [];
     const cb = Date.now();
     try {
-      const pkgRes = await fetch(`${UPDATE_BASE_URL}/package.json?cb=${cb}`, {
+      const pkgRes = await proxy.netFetch(`${UPDATE_BASE_URL}/package.json?cb=${cb}`, {
         headers: { "Cache-Control": "no-cache" },
         signal: AbortSignal.timeout(8000),
       });
@@ -113,7 +268,7 @@ async function checkAndApplyUpdate() {
       }
 
       for (const file of UPDATE_FILES) {
-        const res = await fetch(`${UPDATE_BASE_URL}/${file}?cb=${cb}`, {
+        const res = await proxy.netFetch(`${UPDATE_BASE_URL}/${file}?cb=${cb}`, {
           headers: { "Cache-Control": "no-cache" },
           signal: AbortSignal.timeout(15000),
         });
@@ -161,6 +316,38 @@ async function checkAndApplyUpdate() {
         }
         tmpFiles.push({ tmpPath, targetPath: path.join(__dirname, file) });
       }
+
+      // A release can add a module that an older `UPDATE_FILES` list does not
+      // name. 2.1.0 -> 2.2.0 did exactly that: the new server.js required
+      // ./proxy and ./panel, the old updater never fetched them, and the
+      // restart crash-looped. Read the *incoming* server.js and stage every
+      // local module it imports, so the file list in the running process can
+      // never be the reason a valid release fails to boot.
+      const incoming = tmpFiles.find((f) => path.basename(f.targetPath) === "server.js");
+      if (incoming) {
+        const declared = new Set(tmpFiles.map((f) => path.basename(f.targetPath)));
+        for (const file of localRequires(fs.readFileSync(incoming.tmpPath, "utf8"))) {
+          if (declared.has(file) || fs.existsSync(path.join(__dirname, file))) continue;
+          const res = await proxy.netFetch(`${UPDATE_BASE_URL}/${file}?cb=${cb}`, {
+            headers: { "Cache-Control": "no-cache" },
+            signal: AbortSignal.timeout(15000),
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status} fetching required module ${file}`);
+          const text = await res.text();
+          if (!text || text.length < 20) throw new Error(`empty response for required module ${file}`);
+          try {
+            new Function(text.replace(/^#!.*\n/, ""));
+          } catch (err) {
+            throw new Error(`syntax check failed for required module ${file}: ${err.message}`);
+          }
+          const tmpPath = path.join(__dirname, `.${file}.tmp.${process.pid}`);
+          fs.writeFileSync(tmpPath, text, "utf8");
+          tmpFiles.push({ tmpPath, targetPath: path.join(__dirname, file) });
+          declared.add(file);
+          console.log(`[opencode-free-bridge] Staged newly required module ${file}`);
+        }
+      }
+
       for (const { tmpPath, targetPath } of tmpFiles) fs.renameSync(tmpPath, targetPath);
       console.log(
         `[opencode-free-bridge] Self-updated ${VERSION} → ${remoteVersion}; exiting for service restart.`
@@ -227,6 +414,29 @@ let currentUserAgent = process.env.OPENCODE_USER_AGENT || identity.getUserAgent(
 function syncUserAgent() {
   if (!process.env.OPENCODE_USER_AGENT) currentUserAgent = identity.getUserAgent();
   return currentUserAgent;
+}
+
+/**
+ * Send an inference request to `url`, optionally through the configured egress
+ * relay. The relay contract is the one 9Router's deployable relays speak:
+ * POST <relay> with `x-relay-target: <origin>` and `x-relay-path: <path>`, and
+ * the relay replays method/headers/body at that origin. The origin and path
+ * never travel in the URL, so a relay deployed at a bare workers.dev hostname
+ * works unchanged.
+ *
+ * The request body is serialized once by the caller and passed as a string, so
+ * every retry path can replay it.
+ *
+ * A configured egress proxy applies to whichever URL is finally fetched, so a
+ * relay deployment can itself be dialled through the proxy.
+ */
+function upstreamFetch(url, init) {
+  if (!UPSTREAM_RELAY_URL) return proxy.netFetch(url, init);
+  const parsed = new URL(url);
+  const headers = { ...(init.headers || {}) };
+  headers["x-relay-target"] = parsed.origin;
+  headers["x-relay-path"] = parsed.pathname + parsed.search;
+  return proxy.netFetch(UPSTREAM_RELAY_URL, { ...init, headers });
 }
 
 function isValidV2UserAgent(ua) {
@@ -301,6 +511,98 @@ function isLocalOrigin(origin) {
   return /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(origin.trim());
 }
 
+const LOOPBACK_HOST_RE = /^(localhost|127(?:\.\d{1,3}){3}|\[::1\]|::1)$/i;
+
+/** Hostname from a `Host` header, without the port. IPv6 literals keep brackets off. */
+function hostnameOf(hostHeader) {
+  const raw = String(hostHeader || "").trim();
+  if (!raw) return "";
+  const v6 = raw.match(/^\[([^\]]+)\](?::\d+)?$/);
+  if (v6) return v6[1];
+  return raw.replace(/:\d+$/, "");
+}
+
+/**
+ * Admin-surface gate: the panel and `/api/proxy` can change where every
+ * outbound request goes, so they must not be reachable from a foreign page or
+ * a rebound DNS name.
+ *
+ * The bridge is a local tool with no authentication. Two browser attacks
+ * matter here:
+ *
+ *   - CSRF: any page the operator visits could POST to 127.0.0.1 and point the
+ *     egress at an attacker's proxy. A form POST cannot set
+ *     `Content-Type: application/json`, so requiring it removes the simple
+ *     request; the Origin/Sec-Fetch-Site checks below cover the rest.
+ *   - DNS rebinding: an attacker domain resolving to 127.0.0.1 makes the
+ *     browser send `Host: evil.example`, which a loopback-only listener would
+ *     otherwise accept.
+ *
+ * `PANEL_ALLOWED_HOSTS` (comma-separated) adds names for a reverse proxy or a
+ * deliberate LAN deployment. A bind address other than a wildcard is allowed
+ * automatically, so `HOST=192.168.1.5` keeps its own panel working.
+ */
+function allowedAdminHosts() {
+  const hosts = new Set(["localhost", "127.0.0.1", "::1"]);
+  for (const extra of String(process.env.PANEL_ALLOWED_HOSTS || "").split(",")) {
+    const trimmed = extra.trim().toLowerCase();
+    if (trimmed) hosts.add(trimmed);
+  }
+  const bound = String(HOST || "").toLowerCase();
+  const wildcard = !bound || bound === "0.0.0.0" || bound === "::" || bound === "[::]";
+  if (!wildcard) hosts.add(bound);
+  if (wildcard) {
+    // A wildcard bind is usually reached by one of this machine's own
+    // addresses (LAN IP, VPS public IP). Those are safe to accept and make
+    // `HOST=0.0.0.0` usable without configuration; a rebound attacker domain
+    // is still not in this set. Domain names go in PANEL_ALLOWED_HOSTS.
+    const os = require("os");
+    for (const list of Object.values(os.networkInterfaces())) {
+      for (const addr of list || []) {
+        if (addr && addr.address) hosts.add(String(addr.address).toLowerCase());
+      }
+    }
+  }
+  return hosts;
+}
+
+function adminRequestError(req) {
+  const host = hostnameOf(req.headers?.host).toLowerCase();
+  if (!host) return "Header Host wajib ada.";
+  if (!allowedAdminHosts().has(host)) {
+    return `Host ${host} tidak diizinkan. Panel hanya menerima host lokal; tambahkan ke PANEL_ALLOWED_HOSTS bila ini memang disengaja.`;
+  }
+
+  const site = String(req.headers?.["sec-fetch-site"] || "").toLowerCase();
+  if (site === "cross-site") {
+    return "Permintaan lintas-situs ditolak. Buka panel langsung dari host ini.";
+  }
+
+  // An Origin must match the Host this request was sent to (which covers the
+  // panel itself and an SSH/tunnel forward that keeps the browser's origin),
+  // or be explicitly allow-listed in CORS_ORIGIN. A loopback origin on a
+  // *different* port is another local service, not this panel, so it is not
+  // trusted automatically.
+  const origin = String(req.headers?.origin || "").trim();
+  if (origin) {
+    let originHost = "";
+    try {
+      originHost = new URL(origin).hostname.toLowerCase();
+    } catch {
+      return `Origin ${origin} tidak valid.`;
+    }
+    const configured = String(CORS_ORIGIN || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (originHost !== host && !configured.includes(origin)) {
+      return `Origin ${origin} tidak diizinkan.`;
+    }
+  }
+  return null;
+}
+
+
 /**
  * Kept for callers and tests that expect the old name. Consults the handshake
  * and derives the rest of the recipe from opencode's source.
@@ -335,7 +637,7 @@ async function discoverModels() {
     refreshCliVersion().catch(() => {});
     checkAndApplyUpdate().catch(() => {});
     try {
-    const res = await fetch(resolveEndpoints().modelsUrl, {
+    const res = await proxy.netFetch(resolveEndpoints().modelsUrl, {
       headers: {
         "Authorization": "Bearer public",
         "User-Agent": currentUserAgent,
@@ -1110,6 +1412,11 @@ const MAX_SESSIONS = 500;
 const SESSION_TTL_MS = 3 * 3600 * 1000;
 let lastFailedGateRetryTime = 0;
 let lastFailedGateRetryEpoch = -1;
+// Last IP-level abuse block seen from upstream, if any. Kept apart from the
+// retry cooldown because the two have different causes and different advice:
+// the cooldown is a per-IP allowance window, the block is the gateway refusing
+// this network outright.
+let lastIpAbuseAt = 0;
 // The last gate rejection's correlation id and the shape audit that was true
 // when it happened. `x-opencode-log-id` is the only handle upstream gives for
 // a rejected request, so it is recorded rather than discarded — it is what a
@@ -1130,9 +1437,14 @@ let lastUpstreamError = null;
 function auditGateShape(upstreamBody, headers) {
   const tools = Array.isArray(upstreamBody?.tools) ? upstreamBody.tools : [];
   const toolNames = tools.map((t) => t?.function?.name || t?.name).filter(Boolean);
-  const ua = String(headers?.["User-Agent"] || "");
+  // Header names are compared case-insensitively: the audit must not report a
+  // missing anchor just because the same header arrived with different casing.
+  const headerKey = (name) =>
+    Object.keys(headers || {}).find((k) => k.toLowerCase() === name);
+  const hasHeader = (name) => headerKey(name) !== undefined;
+  const ua = String(headers?.[headerKey("user-agent")] || "");
   const sessionHeaders = ["x-opencode-session", "x-session-affinity", "x-session-id"].filter(
-    (h) => headers?.[h]
+    hasHeader
   );
   return {
     hasReadTool: toolNames.includes("read"),
@@ -1143,10 +1455,57 @@ function auditGateShape(upstreamBody, headers) {
   };
 }
 
+function upstreamLogIdOf(upstreamRes) {
+  return typeof upstreamRes?.headers?.get === "function"
+    ? upstreamRes.headers.get("x-opencode-log-id")
+    : null;
+}
+
+/**
+ * Answer an upstream IP-level abuse block.
+ *
+ * Terminal by construction: the block is keyed to the egress network, so the
+ * identity layer is not consulted, no session id is re-minted, and the request
+ * is not replayed — measured (and confirmed by upstream's own issue tracker)
+ * as a network flag that no client shape can clear. The refusal reaches the
+ * client verbatim; `X-OpenCode-Gate: ip-abuse` lets callers and `verify.js`
+ * tell it apart from the shape gate without parsing the message.
+ */
+function respondIpAbuse(res, status, errType, errMsg, logId, model) {
+  lastIpAbuseAt = Date.now();
+  lastGateDiagnostic = {
+    at: lastIpAbuseAt,
+    kind: "ip-abuse",
+    status,
+    logId: logId || null,
+    message: errMsg,
+    model,
+  };
+  console.warn(
+    `[opencode-free-bridge] Upstream IP-abuse block (${status}): ${errMsg} — not refreshing or retrying; the gateway keys this to this network's IP, so no identity change can clear it` +
+      (logId ? ` [x-opencode-log-id: ${logId}]` : "")
+  );
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    "X-OpenCode-Gate": "ip-abuse",
+    ...(logId ? { "X-OpenCode-Log-Id": logId } : {}),
+  });
+  return res.end(
+    JSON.stringify({
+      error: {
+        message: errMsg,
+        type: errType || "FreeTierError",
+        code: status,
+      },
+    })
+  );
+}
+
 const origSessionCacheClear = sessionCache.clear.bind(sessionCache);
 sessionCache.clear = () => {
   lastFailedGateRetryTime = 0;
   lastFailedGateRetryEpoch = -1;
+  lastIpAbuseAt = 0;
   lastUpstreamError = null;
   return origSessionCacheClear();
 };
@@ -1209,6 +1568,51 @@ function getPersistentSessionId(req, body) {
     sessionCache.set(lookupKey, { sessionId: newSessionId, lastSeen: now });
   }
   return newSessionId;
+}
+
+/**
+ * `/api/proxy` — read and change the egress proxy; `/api/proxy/test` — prove a
+ * candidate reaches upstream before it is trusted.
+ *
+ * The panel is the only caller, so the contract stays small: JSON in, JSON out,
+ * one error field. Credentials are accepted on write and never echoed on read.
+ */
+async function handleProxyApi(req, res, pathname) {
+  const send = (status, body) => {
+    res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    res.end(JSON.stringify(body));
+  };
+
+  if (pathname === "/api/proxy" && (req.method === "GET" || req.method === "HEAD")) {
+    return send(200, proxy.describe());
+  }
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "GET, POST");
+    return send(405, { error: "Gunakan GET untuk status atau POST untuk mengubah." });
+  }
+
+  let payload = {};
+  try {
+    const text = await readRequestBody(req, 16 * 1024);
+    payload = text ? JSON.parse(text) : {};
+  } catch (err) {
+    return send(err.statusCode === 413 ? 413 : 400, { error: `Body tidak valid: ${err.message}` });
+  }
+  if (!payload || typeof payload !== "object" || typeof payload.url !== "string") {
+    return send(400, { error: "Body harus berupa objek dengan field string 'url'." });
+  }
+
+  if (pathname === "/api/proxy/test") {
+    const result = await proxy.testProxy(payload.url, { probeUrl: resolveEndpoints().modelsUrl });
+    return send(result.ok ? 200 : 502, result);
+  }
+
+  const result = proxy.setProxyUrl(payload.url);
+  if (!result.ok) return send(400, { error: result.error });
+  console.log(
+    `[opencode-free-bridge] Egress ${result.mode === "proxy" ? `via proxy ${result.proxy}` : "direct"}`
+  );
+  return send(200, result);
 }
 
 function readRequestBody(req, maxBytes = MAX_BODY_BYTES) {
@@ -1314,10 +1718,59 @@ function handleRequest(req, res) {
   const rawPath = qIdx === -1 ? rawUrl : rawUrl.slice(0, qIdx);
   const pathname = rawPath.length > 1 && rawPath.endsWith("/") ? rawPath.replace(/\/+$/, "") : rawPath;
 
+  // Panel: the human-facing page. JSON consumers keep using /health, which is
+  // why "/" is no longer an alias for the health document.
+  if ((req.method === "GET" || req.method === "HEAD") && (pathname === "" || pathname === "/")) {
+    const denied = adminRequestError(req);
+    if (denied) {
+      res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
+      return res.end(req.method === "HEAD" ? undefined : denied);
+    }
+    const html = panel.renderPanel(proxy.describe(), { version: VERSION, port: PORT });
+    res.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+      "Content-Length": Buffer.byteLength(html),
+      "X-Frame-Options": "DENY",
+    });
+    return res.end(req.method === "HEAD" ? undefined : html);
+  }
+
+  if (pathname === "/api/proxy" || pathname === "/api/proxy/test") {
+    const denied = adminRequestError(req);
+    if (denied) {
+      res.writeHead(403, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      return res.end(JSON.stringify({ error: denied }));
+    }
+    // Only JSON can change the setting. `text/plain` is a CORS "simple
+    // request", so accepting it would let any page POST here without a
+    // preflight; refusing it is the structural half of the CSRF defence.
+    if (req.method === "POST") {
+      const type = String(req.headers?.["content-type"] || "").split(";")[0].trim().toLowerCase();
+      if (type !== "application/json") {
+        res.writeHead(415, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        return res.end(JSON.stringify({ error: "Content-Type harus application/json." }));
+      }
+    }
+    // `handleProxyApi` is async; an unexpected throw must become a 500 instead
+    // of an unhandled rejection that leaves the socket hanging.
+    handleProxyApi(req, res, pathname).catch((err) => {
+      if (res.headersSent) return res.destroy();
+      res.writeHead(500, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ error: `Kesalahan internal: ${err.message}` }));
+    });
+    return;
+  }
+
   // Health check
-  if (pathname === "" || pathname === "/" || pathname === "/health") {
+  if (pathname === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     const idState = identity.getState();
+    const proxyState = proxy.describe();
+    const gateThrottled =
+      lastFailedGateRetryTime > 0 &&
+      Date.now() - lastFailedGateRetryTime < GATE_RETRY_COOLDOWN_MS &&
+      lastFailedGateRetryEpoch === (idState.epoch || 0);
     return res.end(
       JSON.stringify({
         status: "ok",
@@ -1325,6 +1778,16 @@ function handleRequest(req, res) {
         version: VERSION,
         runtime: typeof Bun !== "undefined" ? `bun/${Bun.version}` : `node/${process.versions.node}`,
         discoveredModels: activeModels.length,
+        // Egress in force. `mode` is what actually carries the request: the
+        // proxy when one is configured, otherwise the relay, otherwise direct.
+        // `proxy.mode` only reports whether a proxy exists, so a relay-only
+        // deployment still reads as `relay` here. Credentials are never
+        // included; `proxy.proxy` is host:port only.
+        egress: {
+          mode: proxyState.mode === "proxy" ? "proxy" : UPSTREAM_RELAY_URL ? "relay" : "direct",
+          ...(UPSTREAM_RELAY_URL ? { relay: relayLabel(UPSTREAM_RELAY_URL) } : {}),
+          proxy: proxyState,
+        },
         identity: {
           userAgent: idState.userAgent,
           updateMode: idState.updateMode,
@@ -1350,18 +1813,14 @@ function handleRequest(req, res) {
           toolNames: idState.toolNames,
           tools: idState.tools,
           gate: {
-            status:
-              lastFailedGateRetryTime > 0 &&
-              Date.now() - lastFailedGateRetryTime < GATE_RETRY_COOLDOWN_MS &&
-              lastFailedGateRetryEpoch === (idState.epoch || 0)
-                ? "throttled"
-                : "open",
-            throttledUntil:
-              lastFailedGateRetryTime > 0 &&
-              Date.now() - lastFailedGateRetryTime < GATE_RETRY_COOLDOWN_MS &&
-              lastFailedGateRetryEpoch === (idState.epoch || 0)
-                ? lastFailedGateRetryTime + GATE_RETRY_COOLDOWN_MS
-                : null,
+            status: lastIpAbuseAt > 0 ? "ip-blocked" : gateThrottled ? "throttled" : "open",
+            // The gateway keys an abuse block to the egress network, so there is
+            // no known expiry to advertise. `ipBlockedSince` is the last time
+            // upstream returned that refusal.
+            ipBlockedSince: lastIpAbuseAt || null,
+            throttledUntil: gateThrottled
+              ? lastFailedGateRetryTime + GATE_RETRY_COOLDOWN_MS
+              : null,
             cooldownMs: GATE_RETRY_COOLDOWN_MS,
             // The shape anchors the gate checks. Reported so a deployment can
             // confirm it is sending them without waiting for a 403.
@@ -1537,7 +1996,7 @@ function handleRequest(req, res) {
         let liveEndpoints = resolveEndpoints(targetModel);
         let upstreamUrl = useResponses ? liveEndpoints.responsesUrl : liveEndpoints.chatUrl;
 
-        let upstreamRes = await fetch(upstreamUrl, {
+        let upstreamRes = await upstreamFetch(upstreamUrl, {
           method: "POST",
           headers: upstreamHeaders,
           body: JSON.stringify(upstreamBody),
@@ -1565,7 +2024,7 @@ function handleRequest(req, res) {
             markProtocolSupport(targetModel, useResponses);
             ({ upstreamBody, aliasToOriginal } = buildUpstreamPayload(body, targetModel, useResponses));
             upstreamUrl = useResponses ? liveEndpoints.responsesUrl : liveEndpoints.chatUrl;
-            upstreamRes = await fetch(upstreamUrl, {
+            upstreamRes = await upstreamFetch(upstreamUrl, {
               method: "POST",
               headers: upstreamHeaders,
               body: JSON.stringify(upstreamBody),
@@ -1623,7 +2082,7 @@ function handleRequest(req, res) {
                 `[opencode-free-bridge] Upstream endpoint moved (${upstreamRes.status}): ${staleUrl} → ${derivedUrl}; retrying once`
               );
               upstreamUrl = derivedUrl;
-              upstreamRes = await fetch(upstreamUrl, {
+              upstreamRes = await upstreamFetch(upstreamUrl, {
                 method: "POST",
                 headers: upstreamHeaders,
                 body: JSON.stringify(upstreamBody),
@@ -1655,7 +2114,7 @@ function handleRequest(req, res) {
               (firstLogId ? ` [x-opencode-log-id: ${firstLogId}]` : "") +
               `; retrying once with fresh session`
           );
-          upstreamRes = await fetch(upstreamUrl, {
+          upstreamRes = await upstreamFetch(upstreamUrl, {
             method: "POST",
             headers: retry5xxHeaders,
             body: JSON.stringify(upstreamBody),
@@ -1690,6 +2149,24 @@ function handleRequest(req, res) {
             errJson?.message ||
             errText ||
             `Upstream error ${upstreamRes.status}`;
+
+          // Terminal branch. Upstream names an IP-level abuse block in the
+          // message, and that is a different failure from the shape gate: the
+          // gateway has flagged this network, so refreshing the recipe, minting
+          // a new session id, or replaying the request cannot change the
+          // answer. Measured against the gateway's own reports: the official
+          // CLI gets the same refusal from the same IP. Return it verbatim and
+          // leave the identity layer untouched.
+          if (identity.isIpAbuseRejection(upstreamRes.status, rawMsg)) {
+            return respondIpAbuse(
+              res,
+              upstreamRes.status,
+              errType,
+              rawMsg,
+              upstreamLogIdOf(upstreamRes),
+              targetModel
+            );
+          }
 
           if (!isFreeTierCliGateError(upstreamRes.status, errType, rawMsg)) {
             const upstreamLogId =
@@ -1779,7 +2256,7 @@ function handleRequest(req, res) {
             liveEndpoints = resolveEndpoints(targetModel);
             upstreamUrl = useResponses ? liveEndpoints.responsesUrl : liveEndpoints.chatUrl;
             retryHeaders = buildUpstreamHeaders(req, retrySessionId);
-            upstreamRes = await fetch(upstreamUrl, {
+            upstreamRes = await upstreamFetch(upstreamUrl, {
               method: "POST",
               headers: retryHeaders,
               body: JSON.stringify(upstreamBody),
@@ -1835,7 +2312,25 @@ function handleRequest(req, res) {
             // floor handshake followed by a 429 capacity answer is common), and
             // logging the old status misattributes the final verdict.
             const retryStatus = upstreamRes.status;
-            const retryFreeTierMsg = /freetiererror|free tier|only available in opencode/i.test(retryMsg);
+            // The retry can reveal the block even when the first attempt still
+            // carried the shape message (upstream mixes the two while a flag is
+            // being applied). That is still terminal: answer it verbatim and do
+            // not run the shape audit or append an update hint.
+            if (identity.isIpAbuseRejection(retryStatus, retryMsg)) {
+              if (!skipCooldownRetry) {
+                lastFailedGateRetryTime = Date.now();
+                lastFailedGateRetryEpoch = identity.getState().epoch || 0;
+              }
+              return respondIpAbuse(
+                res,
+                retryStatus,
+                retryType,
+                retryMsg,
+                upstreamLogIdOf(upstreamRes),
+                targetModel
+              );
+            }
+            const retryFreeTierMsg = /freetiererror|free tier|free models|only available in opencode/i.test(retryMsg);
             const onNode = typeof Bun === "undefined";
             // A 429 means transport and shape both passed and only capacity is
             // exhausted. Calling that a gate rejection would send the user to
@@ -1863,12 +2358,10 @@ function handleRequest(req, res) {
             // Correlation id for this rejection. Upstream returns it on every
             // response, accepted or refused; it is the only handle a support
             // request or a bug report can quote.
-            const upstreamLogId =
-              typeof upstreamRes.headers?.get === "function"
-                ? upstreamRes.headers.get("x-opencode-log-id")
-                : null;
+            const upstreamLogId = upstreamLogIdOf(upstreamRes);
             lastGateDiagnostic = {
               at: Date.now(),
+              kind: "free-tier-gate",
               status: retryStatus,
               logId: upstreamLogId,
               shape,
@@ -1887,7 +2380,11 @@ function handleRequest(req, res) {
                     : `this bridge produced a shape the gate refuses — missing ${missing.join(", ")}. That is a bridge bug, not an IP allowance: the same 403 is returned for both, which is why it is audited here`
                 : `no further identity change to apply; ${UPDATE_HINT}`;
             console.warn(
-              `[opencode-free-bridge] Upstream CLI gate rejected the retry with the refreshed identity (${retryStatus}${
+              `[opencode-free-bridge] Upstream CLI gate rejected ${
+                skipCooldownRetry
+                  ? "the request (no retry: cooldown active)"
+                  : "the retry with the refreshed identity"
+              } (${retryStatus}${
                 retryStatus !== gateStatus ? `, first attempt ${gateStatus}` : ""
               }): ${retryMsg} — ${verdictText}` +
                 (upstreamLogId ? ` [x-opencode-log-id: ${upstreamLogId}]` : "")
@@ -1916,6 +2413,7 @@ function handleRequest(req, res) {
         }
 
         lastFailedGateRetryTime = 0;
+        lastIpAbuseAt = 0;
         const completionId = `chatcmpl-${crypto.randomBytes(12).toString("hex")}`;
         const created = Math.floor(Date.now() / 1000);
         reader = upstreamRes.body.getReader();
@@ -2474,6 +2972,11 @@ if (require.main === module) {
       );
     }
   });
+  // Repair a half-installed tree (an older self-updater that did not know about
+  // proxy.js/panel.js) after the socket is open, so a slow or absent network
+  // never delays startup. The panel reads the current binding per request, so
+  // it starts working as soon as the repair lands.
+  repairMissingModules().catch(() => {});
   // Discovery runs in background: /v1/models is live as soon as upstream
   // answers. Boot never blocks on network.
   discoverModels().catch(() => {});
@@ -2554,4 +3057,7 @@ module.exports = {
   __setLastCliVersionCheckTime: (v) => { lastCliVersionCheckTime = v; },
   __getCliVersionState: () => ({ lastCliVersionCheckTime }),
   __setLastUpdateCheck: (v) => { lastUpdateCheck = v; },
+  __localRequires: localRequires,
+  __repairMissingModules: repairMissingModules,
+  __adminRequestError: adminRequestError,
 };
