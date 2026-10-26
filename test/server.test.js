@@ -229,6 +229,53 @@ describe("server unit & integration tests", () => {
     assert.equal(respBody.top_p, 0.9);
   });
 
+  it("adds the harness <env> block the gateway requires, in both lanes", () => {
+    // Measured live 2026-10-25: a system prompt without `<env>` + a
+    // `Working directory:` line is answered with `429 FreeUsageLimitError` —
+    // the same message as an exhausted allowance — while a 65-byte env block
+    // passes. A 12 KB generic prompt still fails, so this is a shape anchor,
+    // not a length rule. Both lanes must carry it or the bridge looks throttled.
+    const envRe = /<env>[\s\S]*?Working directory:[\s\S]*?<\/env>/;
+    const model = "glm-5.3-flash-free";
+    const user = { role: "user", content: "hi" };
+
+    // Chat lane, no system message at all: one is synthesized.
+    const bare = buildUpstreamPayload({ model, messages: [user] }, model, false, "core").upstreamBody;
+    assert.match(bare.messages[0].content, envRe);
+    assert.equal(bare.messages[0].role, "system");
+
+    // Chat lane, short client system prompt: the block is appended, the
+    // client's own text is preserved verbatim.
+    const short = buildUpstreamPayload(
+      { model, messages: [{ role: "system", content: "You are helpful." }, user] },
+      model,
+      false,
+      "core"
+    ).upstreamBody;
+    assert.match(short.messages[0].content, /^You are helpful\./);
+    assert.match(short.messages[0].content, envRe);
+
+    // A client that already forwards the CLI's prompt keeps its own block —
+    // exactly once, not doubled.
+    const own = "<env>\n  Working directory: /x\n</env>";
+    const forwarded = buildUpstreamPayload(
+      { model, messages: [{ role: "system", content: `prompt\n\n${own}` }, user] },
+      model,
+      false,
+      "core"
+    ).upstreamBody;
+    assert.equal(forwarded.messages[0].content.match(/<env>/g).length, 1);
+    assert.match(forwarded.messages[0].content, /Working directory: \/x/);
+
+    // Responses lane carries the same anchor in `instructions`.
+    const responses = buildUpstreamPayload(
+      { model, messages: [{ role: "system", content: "You are helpful." }, user] },
+      model,
+      true,
+      "core"
+    ).upstreamBody;
+    assert.match(responses.instructions, envRe);
+  });
   it("avoids session hash collisions when headerless requests share a >1000-char prefix", () => {
     const sharedPrefix = "S".repeat(2000);
     const bodyA = {
@@ -1190,6 +1237,97 @@ describe("server unit & integration tests", () => {
       });
       assert.equal(rateRes.status, 429);
       assert.equal(rateRes.body.error.message, "Endpoint is unavailable");
+    });
+
+    it("moves to another pool entry when an egress is out of allowance", async () => {
+      // The failure this covers: a 429 never reaches the gate branch, so before
+      // this the pool recorded nothing and every later request picked the same
+      // spent IP. Measured on the fleet: six requests rotated six IPs, four of
+      // them answered 429, and /health still showed every entry ready.
+      const fs = require("node:fs");
+      const os = require("node:os");
+      const path = require("node:path");
+      const proxy = require("../proxy");
+
+      const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "ofb-429-pool-"));
+      const previousStateDir = process.env.OPENCODE_BRIDGE_STATE_DIR;
+      process.env.OPENCODE_BRIDGE_STATE_DIR = stateDir;
+      delete process.env.UPSTREAM_PROXY_POOL;
+      proxy.__reload();
+      proxy.resetHealth();
+
+      try {
+        const saved = proxy.setPool({
+          entries: ["http://first:1", "http://second:2"],
+          strategy: "failover",
+          cooldownMs: 60000,
+        });
+        assert.equal(saved.ok, true);
+
+        const spent = new Set();
+        const usedEgress = [];
+        mockFetchImpl = async (_url, init) => {
+          // Bun's fetch carries the egress in `init.proxy`; the pool entry that
+          // was in force is what the test cares about.
+          const egress = init?.proxy || "direct";
+          usedEgress.push(egress);
+          if (egress === "http://first:1") {
+            spent.add(egress);
+            return {
+              ok: false,
+              status: 429,
+              text: async () =>
+                JSON.stringify({
+                  error: {
+                    type: "FreeUsageLimitError",
+                    message: "Free usage limit reached.",
+                  },
+                }),
+            };
+          }
+          return {
+            ok: true,
+            status: 200,
+            body: sseStreamFromLines([
+              'data: {"id":"1","choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":"stop"}]}\n\n',
+              "data: [DONE]\n\n",
+            ]),
+          };
+        };
+
+        const first = await httpRequest(port, "POST", "/v1/chat/completions", {
+          model: "glm-5.3-flash-free",
+          messages: [{ role: "user", content: "pool-429" }],
+          stream: true,
+        });
+        assert.equal(first.status, 200, "the retry through a healthy entry must succeed");
+        assert.deepEqual(usedEgress, ["http://first:1", "http://second:2"]);
+
+        const state = proxy.describe();
+        const firstEntry = state.pool.entries.find((e) => e.host === "first:1");
+        const secondEntry = state.pool.entries.find((e) => e.host === "second:2");
+        assert.equal(firstEntry.state, "cooling", "the spent egress must be parked");
+        assert.equal(firstEntry.failures, 1);
+        assert.equal(secondEntry.state, "ready");
+        assert.equal(state.pool.ready, 1);
+
+        // The next request must not go back to the spent entry.
+        usedEgress.length = 0;
+        const second = await httpRequest(port, "POST", "/v1/chat/completions", {
+          model: "glm-5.3-flash-free",
+          messages: [{ role: "user", content: "pool-429-again" }],
+          stream: true,
+        });
+        assert.equal(second.status, 200);
+        assert.deepEqual(usedEgress, ["http://second:2"]);
+      } finally {
+        proxy.setPool({ entries: [] });
+        proxy.resetHealth();
+        if (previousStateDir === undefined) delete process.env.OPENCODE_BRIDGE_STATE_DIR;
+        else process.env.OPENCODE_BRIDGE_STATE_DIR = previousStateDir;
+        proxy.__reload();
+        fs.rmSync(stateDir, { recursive: true, force: true });
+      }
     });
 
     it("retries once with a fresh session ID on transient upstream 5xx and recovers to 200", async () => {

@@ -1,5 +1,147 @@
 # Changelog
 
+## [2.3.1] — 2026-10-25
+
+Pool health survives a restart.
+
+A pool that forgets its cooldowns re-burns every spent IP on the first request
+after a restart, which is exactly what an Instabox suspend/resume does eight
+times a day. The rotation was correct; its memory was not.
+
+- Cooldowns, failure counts and last-seen timestamps are written to
+  `<state dir>/pool-health.json` (mode `0600`) and re-applied by
+  `loadFromDisk()`. A restart now resumes with the same pool state it went down
+  with.
+- Records are keyed by a truncated SHA-256 of the egress identity, so the health
+  file is not a second copy of the proxy credentials sitting next to
+  `proxy.json`.
+- A refusal writes immediately; a success is coalesced over one second. The file
+  is written by rename, so a crash mid-write keeps the previous copy.
+- A corrupt health file costs the cooldowns and nothing else.
+- `setPool` no longer calls `resetHealth()`: saving the pool from the panel —
+  including a strategy change — used to discard every cooldown it had learned.
+  Removed entries are still pruned and the file is rewritten to match.
+
+## [2.3.0] — 2026-10-25
+
+Egress pool: one bridge, many exit IPs.
+
+The free-tier allowance is per egress IP, so the previous answer to "I need more
+IPs" was one bridge process per host: eight hosts, eight service units, eight
+tunnels, eight catalogs to keep in step. The pool moves that rotation into the
+one thing that already makes the request, and the per-host process goes away.
+
+### Pool (`proxy.js`, `server.js`)
+
+- A pool is a list of entries (`url`, `{id,label,url,enabled,weight}`, or
+  `{direct: true}` for the hosting machine's own address). `direct` is a
+  first-class entry, so the bridge host's IP takes part in the rotation instead
+  of being the fallback used only when every proxy is down.
+- Strategies: `round-robin` (default), `failover` (sticky, preserving upstream
+  prompt caching on one IP), `random` (weighted).
+- Health is per entry and keyed by egress identity, not by URL, so `direct`
+  cannot share a record with a proxy. Backoff doubles per consecutive failure
+  from `cooldownMs` (120 s) up to `maxCooldownMs` (30 min); a success resets it.
+  A `429` earns four times the base window.
+- When every entry is cooling the one that recovers first is used anyway:
+  refusing to send would turn a throttled pool into a dead bridge.
+- A gate rejection drops the refused entry and retries through a different one
+  inside the same request. An unreachable proxy is failed over too, because
+  nothing reached upstream; that path used to surface a 500 to the client.
+- Every non-egress retry (protocol lane, endpoint migration, 5xx, gate shape)
+  reuses the entry the request started on, since upstream ties a retry to the
+  address that saw the first attempt.
+- `UPSTREAM_PROXY_POOL` / `UPSTREAM_PROXY_STRATEGY` are operator overrides that
+  lock runtime edits, matching `UPSTREAM_PROXY_URL`.
+
+### Egress proxy (`egress-proxy.js`)
+
+A dependency-free HTTP proxy so a host can become a pool member without root, a
+package install, or a config file: CONNECT plus absolute-URI HTTP, optional
+`EGRESS_PROXY_TOKEN` (Basic, password only), unauthenticated `/healthz` carrying
+nothing but a connection count and uptime. TLS is tunneled end to end, so it
+never sees plaintext. It binds loopback; reachability is the tunnel's job.
+
+`egress-proxy.js` ships through `UPDATE_FILES`, `install.sh` and `package.json`
+`files[]`, and `install.sh` marks it executable.
+
+### Panel
+
+`/` gains a pool section: one proxy per line (`label=url`), strategy selector,
+*Uji semua* (probes every entry concurrently and records the verdict in the same
+health map the request path uses), *Simpan pool*, and *Kosongkan pool*. The
+status block lists each entry with its state, remaining cooldown, failure count
+and last error.
+
+### Fixed
+
+- A `429 FreeUsageLimitError` never marked its egress. `isFreeTierCliGateError`
+  only recognises 401/403/426, so the refusal fell into the generic non-gate
+  branch and the pool learned nothing. Measured on the fleet: six requests
+  rotated through six IPs, four answered 429, and `/health` still showed every
+  entry `ready` — the pool burned the whole rotation on every request. A 429 now
+  parks that entry (four base windows) and the same request retries through
+  another one.
+- A 5xx does *not* park the egress: that is upstream's fault, and treating it as
+  the IP's would empty the pool during a bad hour at the gateway.
+- `markFailure`/`markSuccess` treated the `direct` entry's empty URL as "nothing
+  to record", so an exhausted bridge host IP was never cooled down. Health is
+  keyed by egress identity now, and only a missing state means nothing to record.
+- `pick({exclude})` let a round-robin selection return the excluded entry,
+  defeating the retry-on-another-egress path entirely.
+- `withProxy({}, "")` treated the `direct` entry's empty URL as "no egress" and
+  fell back to a pool pick, so an explicitly pinned direct egress was ignored.
+
+## [2.2.2] — 2026-10-25
+
+Fleet release: the catalog-freeze fix plus the delivery fixes below. Every
+machine was on 2.2.1, whose `/v1/models` could stay frozen for the life of the
+process, so this is the version the fleet is pinned to.
+
+### Upstream catalog froze on crashed boots (identity.js)
+
+Boot-time warm-start from `~/.opencode-free-bridge/cache/catalog.json` filled
+`freeModels`, and `refresh()` only re-read the provider catalog when that list
+was empty — so a booted process served a permanent snapshot: retired models
+(measured: `minimax-m3.1-flash-free` answered upstream with `404` while still
+listed) stayed in `/v1/models`, and clients spent the per-IP free burst quota
+probing ids upstream no longer knows.
+
+- Both the "up-to-date" and "available-not-adopted" branches of `refresh()`
+  now re-read the catalog. `refresh()` is TTL-gated by `ensureFresh`, so this
+  costs at most one request per refresh interval.
+- `verify.js` now breaks its sweep at the first `429` the same way it already
+  breaks on `403 gate-closed` — hammering every model while the IP is
+  throttled only prolongs the allowance window.
+- `THIRD_PARTY_NOTICES.md` now ships through both delivery paths
+  (`UPDATE_FILES` and `install.sh`), fixing the delivery test.
+
+### 429 FreeUsageLimitError was a request-shape problem, not a quota
+
+The gateway answers `429 FreeUsageLimitError` for two unrelated things: an
+exhausted free-tier allowance, and a system prompt that lacks the harness
+`<env>` block. Only the second one applied here — the CLI answered while the
+bridge was refused in the same minute, repeatedly, which the previous
+"time-of-measurement artifact" note could not explain.
+
+- Reproduced by capturing the CLI's own request (`opencode run` through a local
+  provider pointing at a capture server) and replaying it byte-for-byte: 200.
+  The same body with the system prompt replaced by a short one: 429. Both went
+  out with the same headers, session id and TLS stack, so the difference is the
+  body.
+- The trigger is the `<env>` block plus a `Working directory:` line, not the
+  prompt length: a 12 KB generic prompt is refused, a 65-byte
+  `<env>Working directory: /tmp</env>` is accepted, and `big-pickle` and
+  `mimo-v2.6-flash-free` behave identically. Dropping every tool (`tools: []`)
+  produces the same 429, which is why that case also looked like a quota error.
+- `transformChatMessages` and `extractSystemInstructions` now append the block
+  (working directory, workspace root, git-repo flag, platform) to whichever
+  system prompt the request carries, synthesizing one when the client sent
+  none. A client forwarding the CLI's own prompt keeps its block unchanged and
+  gets no duplicate.
+- Covered by a regression test in `test/server.test.js` for both protocol
+  lanes.
+
 ## [2.2.1] — 2026-10-22
 
 Hardening for the egress proxy shipped in 2.2.0. The feature worked, but three
