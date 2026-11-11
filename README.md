@@ -1,6 +1,6 @@
 # opencode-free-bridge
 
-OpenAI-compatible local API bridge for [OpenCode](https://opencode.ai) free-tier models. No account and no API key required.
+OpenAI/Anthropic-compatible local API bridge for [OpenCode](https://opencode.ai) free-tier models. No account and no API key required.
 
 It runs a local server on `http://127.0.0.1:20129/v1` that any OpenAI-compatible client (9Router, Cursor, Continue, LiteLLM, Open WebUI, or the OpenAI SDK) can call directly.
 
@@ -176,6 +176,24 @@ docker run -d --name opencode-free-bridge \
 2. Models are imported as `zen/big-pickle`, `zen/mimo-v2.6-flash-free`, `zen/nemotron-3-ultra-free`, etc.
 3. Optional: if you run the bridge on multiple hosts (for example, a laptop and a VPS), register each host as a separate connection in 9Router so per-IP rate limits fail over automatically.
 
+**9Router's SSRF guard blocks `127.0.0.1` by default.** The guard exists so a
+request cannot reach an internal address, and the bridge's own base URL looks
+exactly like one. Two ways through, depending on how 9Router was started:
+
+| 9Router started… | What to do |
+|---|---|
+| With `ALLOW_PRIVATE_NETWORKING=true` | Nothing. The guard short-circuits for the whole process, so loopback works as documented above. |
+| Without it | Add `ALLOW_PRIVATE_NETWORKING=true` to its service environment and restart. |
+
+Symptom without it: the connection's test button fails and chat answers an
+error, both reporting `request to private/reserved IP blocked by SSRF
+protection`. The bridge itself is fine — `curl http://127.0.0.1:20129/health`
+still answers `ok` from that host, so those two symptoms together mean the
+guard, not the bridge.
+
+This only applies to 9Router running on the same machine. Every other client
+(LiteLLM, the OpenAI SDK, Cursor) talks to loopback directly and is unaffected.
+
 ### LiteLLM, Open WebUI, Continue, Cursor
 
 Use the same three settings: Base URL `http://127.0.0.1:20129/v1`, API key `public`, and model IDs from `/v1/models`.
@@ -189,6 +207,48 @@ model_list:
       api_base: http://127.0.0.1:20129/v1
       api_key: public
 ```
+
+### Anthropic Messages API
+
+The bridge also serves Anthropic's native `POST /v1/messages`, so Claude Code and
+the Anthropic SDK can point at it directly. Model ids are the same bare ids the
+OpenAI endpoint uses.
+
+| Setting | Value |
+|---|---|
+| Base URL | `http://127.0.0.1:20129` |
+| API key | `public` (sent as `x-api-key`, any non-empty string works) |
+| Path | `/v1/messages` |
+
+```bash
+curl -s http://127.0.0.1:20129/v1/messages \
+  -H 'Content-Type: application/json' \
+  -H 'x-api-key: public' \
+  -d '{"model":"big-pickle","max_tokens":1024,
+       "messages":[{"role":"user","content":"Reply with OK"}]}'
+```
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic(base_url="http://127.0.0.1:20129", api_key="public")
+message = client.messages.create(
+    model="big-pickle",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Reply with OK"}],
+)
+print(message.content[0].text)
+```
+
+Streaming is real, not replayed: `stream: true` relays each upstream delta as it
+arrives, including `input_json_delta` for tool calls. `POST
+/v1/messages/count_tokens` also answers — with a conservative 4-chars-per-token
+estimate, because this bridge has no Anthropic tokenizer and a made-up exact
+number would be worse than an honest approximation.
+
+Anthropic-only parameters with no OpenAI equivalent — `thinking`, `top_k`,
+`metadata`, `container` — are ignored, and the bridge logs one line naming them
+so a caller that expected a thinking budget can see why it got none.
 
 ### Coding agents & CLI tools
 
@@ -400,7 +460,7 @@ Before running the 4 live drills, `gate-drill.js` sends a single CLI-shaped cont
 | `UPDATE_MODE` | `reactive` | `reactive` adopts new CLI releases only on `403`/`426` or `minimum: true`; `always` adopts every release on TTL expiry |
 | `GATE_RETRY_COOLDOWN_MS` | `30000` | Cooldown window (ms) after a failed full-shape `403` retry during which duplicate retries are suppressed until identity changes |
 | `GATE_REFRESH_COOLDOWN_MS` | `30000` | Cooldown window (ms) between forced GitHub/catalog refreshes during a `403` burst |
-| `DNS_RESULT_ORDER` | `ipv4first` | DNS resolution order passed to `dns.setDefaultResultOrder` (`ipv4first`, `ipv6first`, `verbatim`) |
+| `DNS_RESULT_ORDER` | `ipv4first` | DNS resolution order passed to `dns.setDefaultResultOrder` (`ipv4first`, `ipv6first`, `verbatim`). Read by both `server.js` and `egress-proxy.js`: the gateway refuses IPv6 egress, so a pool member on a dual-stack host must not dial upstream over AAAA |
 | `TOOL_PROFILE_SCOPE` | `core` | `core` sends the minimal gate anchor (`read`, `shell`) on first attempt and escalates to `full` (all model-applicable tools) on retry; `full` sends the full tool profile on every request |
 | `OPENCODE_CHANNEL` | `latest` | OpenCode release channel (`latest`, `beta`, `dev`) |
 | `OPENCODE_MAJOR` | _(unset)_ | Pin a major version line (for example `2`) |

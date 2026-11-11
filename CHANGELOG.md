@@ -1,4 +1,106 @@
 # Changelog
+## [2.4.0] — 2026-11-10
+
+Anthropic's Messages API, with streaming that is actually streamed.
+
+Claude Code and anything built on the Anthropic SDK speak `/v1/messages`, which
+this bridge did not serve. The adapter relays through this bridge's own
+`/v1/chat/completions`, so the Anthropic path inherits the gate anchors, session
+minting, egress pool and self-healing retries instead of reimplementing them.
+
+- `POST /v1/messages` accepts `system` blocks, `tool_use` / `tool_result`
+  content, `tool_choice` and `stop_sequences`, and answers either Anthropic JSON
+  or SSE.
+- Streaming is forwarded as it arrives. The first version of this adapter
+  buffered the whole completion and replayed it as SSE: measured, nine events
+  landed in 17ms with a single `content_block_delta`, so a long generation
+  looked frozen. The relay now emits each upstream delta immediately, including
+  `input_json_delta` for tool calls, and asks upstream for
+  `stream_options.include_usage` so a streamed reply still reports tokens.
+- `POST /v1/messages/count_tokens` answers with a conservative
+  four-characters-per-token estimate. There is no Anthropic tokenizer here, and
+  an invented exact number would be worse than a stated approximation.
+- Anthropic-only parameters with no OpenAI equivalent (`thinking`, `top_k`,
+  `metadata`, `container`) are ignored with one log line naming them.
+- `anthropic.js` joined `UPDATE_FILES`: a release whose `server.js` requires it
+  would otherwise crash-loop on installs that never fetched it.
+
+## [2.3.2] — 2026-11-10
+
+A rotated address clears the cooldown its predecessor earned, and an
+all-cooling pool stops spending requests it knows will be refused.
+
+The free allowance is keyed to the address upstream sees, not to the URL of the
+proxy in front of it. A phone on mobile data rotates that address several times
+a day, and every rotation hands back a fresh allowance — but the pool tracked
+health per proxy URL, so a `Retry-After` of 13 hours (measured: `47674s`, the
+next midnight UTC) kept the phone parked long after the address that earned the
+refusal was gone. Measured on a live pool: the phone answered `200` on six
+consecutive requests while `/health` still reported it cooling with 13.7 hours
+left, and the bridge returned `429` to the client because every member looked
+spent. The other three members really were spent; the phone was not.
+
+- The recovery watchdog now reads each parked entry's exit address from
+  `cdn-cgi/trace` and clears the cooldown when it changes, because a new address
+  means a new allowance. The address is persisted in `pool-health.json`, so a
+  restart mid-cooldown can still notice the rotation instead of trusting stale
+  evidence. `proxy.recoveryProbeTick()` runs once a minute.
+- A 429 no longer walks a pool whose members are all cooling. `pick()` reports
+  `cooling: true` when nothing is ready; walking the pool then spends one
+  request per entry on upstreams that already refused each of them, which is how
+  an egress that served nothing that day still accumulated failures and got
+  stamped with a fresh 429.
+- The caller now receives upstream's real `Retry-After` on a capacity 429. That
+  path is a passthrough, not the gate branch, so the header was dropped and
+  clients retried immediately into a still-spent pool.
+- `priority-failover` strategy and the per-egress usage meter (`meter: false`
+  opts an entry out) are now in `main` rather than only on the deployment.
+- Gateway price list reconciles the catalog verdicts: an id the gateway serves
+  at zero price is free even when the catalog still marks it deprecated, and a
+  catalog-free id the gateway has stopped serving is no longer advertised —
+  it sent clients into a 404 that burned their burst quota.
+
+## [Unreleased]
+A pool member no longer burns its allowance over the address family the gateway refuses.
+
+The free tier refuses IPv6 egress and accepts IPv4: the same request, from the
+same host, answered `200` over IPv4 and `429 FreeUsageLimitError` over IPv6. Bun
+resolves in `verbatim` order by default, and every dual-stack host listed AAAA
+for `opencode.ai` first. `server.js` already pinned `ipv4first` for its own
+fetches, but `egress-proxy.js` dials the upstream itself for every CONNECT and
+did not — so a pool member tunnelled every request out over IPv6, was refused,
+and took the whole pool into a day-long cooldown. Six of eight members were
+unusable while their IPv4 addresses still had allowance.
+
+- `egress-proxy.js` calls `dns.setDefaultResultOrder(DNS_RESULT_ORDER || "ipv4first")`
+  at startup, matching `server.js`. Pool entries on dual-stack hosts now exit
+  over IPv4 and answer `200`.
+- The `Retry-After` cooldown above made this worse: a refusal recorded by the
+  IPv6 path parked the entry until the next daily reset, so the family could not
+  be re-tested until then.
+
+A spent egress stays spent, and a 429 no longer reaches the caller early.
+
+OpenCode resets the free allowance once a day and says so: a spent IP answers
+`429 FreeUsageLimitError` with `Retry-After: ~77415` (about 21.5 hours). The
+bridge ignored that header and parked the IP for `cooldownMs * 4` — 8 minutes —
+then backed off exponentially to a 30-minute cap. A spent IP therefore rejoined
+rotation every 8-30 minutes, was refused again, and burned one request on every
+probe. Under `failover`, which always returns `healthy[0]`, the same spent IP at
+the front of the pool was retried first while the rest of the pool idled.
+
+- `retryAfterMs(res)` reads `Retry-After` (delta-seconds or HTTP-date) and all
+  four 429 sites pass it as `cooldownMs`, so a spent entry leaves rotation until
+  the allowance actually returns. Missing or unparseable headers keep the old
+  fixed cooldown, so a gateway that omits the header cannot regress.
+- A 429 now walks the whole pool instead of failing over once. Two spent IPs at
+  the front used to hand the caller a 429 while six healthy IPs sat idle; now
+  every enabled member is tried and `429` only reaches the caller when the pool
+  is exhausted, which is the honest answer at that point.
+- Each refusal on the walk is recorded with that response's own `Retry-After`,
+  so a second spent IP is parked for its own reset window rather than the
+  default.
+- `proxy.js`: comment wording only (an upstream suspend, not a specific host).
 
 ## [Unreleased]
 
